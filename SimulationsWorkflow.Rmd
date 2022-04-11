@@ -1,0 +1,288 @@
+---
+title: "Paleopop Workflow"
+author: "Elisabetta Canteri"
+date: "11/04/2022"
+output:
+  pdf_document: default
+---
+
+This document explains how to run process-explicit simulations using the 'poems' and 'paleopop' packages in R. This example only includes 10 simulations, which will run from 21 ka BP to 0 BP.
+
+This workflow shows how to:
+
+1. Create a simulation model template with a study region.
+2. Create generators for initial abundance, carrying capacity, dispersal and human density
+3. Latin Hypercube sampling of parameter values that will be input for the simulations
+4. Build a simulator manager to run the simulations
+
+```{r libraries}
+library(raster)
+library(ggplot2)
+library(poems)
+library(paleopop)
+library(data.table)
+library(sf)
+```
+
+We start by importing the study region, the ice mask, the human abundance data and the Greenland polygon that will be used to mask initial abundances in suitable cells in Greenland. All have been previosly calculated. The study region was determined based on the spatial extent of the fossil record, and by applying a 500 km buffer around climatically suitable areas, from full niche projection. The ice mask shows percentage of land in a grid cell through time (between 0 and 1, where 0 is 100% ice and 1 is 0% ice, i.e. land). We also define burn-in steps, which will be added at the beginning of the simulations.
+
+```{r data}
+DATA_DIR <- "./Data/"
+
+burn_in_steps <- 100L
+
+region <- readRDS(file.path(DATA_DIR, "reindeer_region_prj.RDS"))
+raster::plot(region$region_raster, main = "Reindeer region (cell indices)",
+             xlab = "Longitude (meters)", ylab = "Latitude (meters)",
+             colNA = "blue")
+
+ice_inv <- readRDS(file.path(DATA_DIR, "ice_inv_prj.RDS"))
+ice_inv <- apply(ice_inv, 2, round, 2)
+ice_inv <- cbind(replicate(burn_in_steps, ice_inv[,1]), ice_inv)
+dim(ice_inv)
+
+humans_mean <- readRDS(file.path(DATA_DIR, "rt_humans_mean_prj.RDS"))
+humans_mean <- humans_mean[region$region_indices,]
+humans_mean[!is.finite(humans_mean)] <- 0
+humans_mean <- cbind(replicate(burn_in_steps, humans_mean[,1]), humans_mean)
+dim(humans_mean)
+
+humans_sd <- readRDS(file.path(DATA_DIR, "rt_humans_sd_prj.RDS"))
+humans_sd <- humans_sd[region$region_indices,]
+humans_sd[!is.finite(humans_sd)] <- 0
+humans_sd <- cbind(replicate(burn_in_steps, humans_sd[,1]), humans_sd)
+dim(humans_sd)
+
+gnld_poly <- rgdal::readOGR(file.path(DATA_DIR, "GreenlandPolygon/GreenlandPolygon_new.shp"))
+gnld_poly <- sf::st_as_sf(gnld_poly)[1,]
+gnld_region <- mask(region$region_raster, gnld_poly)
+gnld_pops <- values(gnld_region)[which(!is.na(values(gnld_region)))]
+```
+
+We now have to generate data that will be used in the next steps. Data include a friction matrix, distance matrix, which defines distance between grid cells of the study region, and a distance-based environmental correlation. The friction mask is very similar to the ice mask, and determines cells where hard barriers in the simulation occur through time, for example where grid cells are completely covered by ice or by water. The friction mask is calculated using the land-sea mask inside the region S6 class and the ice mask. To generate the distance matrix and the environmental correlation we will use functions already present in the poems package.
+
+```{r generate data}
+# Friction matrix
+friction <- region$temporal_mask*ice_inv[,101:3101]
+friction <- cbind(replicate(burn_in_steps, friction[,1]), friction)
+dim(friction)
+
+# Distance matrix
+distance_matrix <- DispersalGenerator$new(region = region,
+                                          dispersal_max_distance = 700,
+                                          distance_scale = 1000)
+
+distance_matrix <- distance_matrix$calculate_distance_matrix()
+dim(distance_matrix)
+
+# Compact decomposition
+# Distance-based environmental correlation (via a compacted Cholesky decomposition)
+env_corr <- SpatialCorrelation$new(region = region, amplitude = 0.99, breadth = 850, distance_scale = 1000)
+env_corr$calculate_correlations(distance_matrix = distance_matrix) # all decimals
+env_corr$calculate_cholesky_decomposition(decimals = 3)
+compact_decomposition <- env_corr$get_compact_decomposition() # default threshold
+# it is suggested to save the compact_decomposition variable and import it when running the simulations, in order to avoid calculating it every time
+env_corr <- SpatialCorrelation$new(region = region, amplitude = 0.99, breadth = 850, distance_scale = 1000)
+env_corr$t_decomposition_compact_matrix <- compact_decomposition$matrix
+env_corr$t_decomposition_compact_map <- compact_decomposition$map
+```
+
+Now we can start with the first step: defining a model template which includes only fixed parameters.
+
+```{r Step 1: model template}
+timesteps <- 3101
+
+# Population (simulation) model template for fixed parameters
+model_template <- PaleoPopModel$new(
+  region = region,
+  time_steps = timesteps, # include burn-in
+  years_per_step = 7,
+  populations = region$region_cells,
+  # initial_abundance: generated
+  transition_rate = 1.0,
+  # standard_deviation: sampled
+  compact_decomposition = compact_decomposition,
+  # carrying_capacity: generated
+  density_dependence = "logistic",
+  # growth_rate_max: sampled
+  harvest = TRUE,
+  # harvest_max: sampled
+  harvest_g = 0.4, # constant
+  # harvest_z: sampled
+  # harvest_max_n: sampled
+  # human_density: generated
+  dispersal_target_k = 10,
+  # dispersal_data: generated
+  # abundance_threshold: sampled,
+  occupancy_threshold = 1,
+  results_selection = c("abundance", "harvested"),
+  attribute_aliases = list(density_max = "harvest_max_n")
+)
+```
+
+The next step is to define the generators that will be used in the simulations. These generators are a capacity generator, which will be used to generate initial abundance and carrying capacity, base don habitat suitability, a dispersal generator, which will determine dispersal of populations through time, and a human density generator. Before setting the dispersal generator, we will have to calculate a dispersal matrix, which accounts for environmental correlation and landscape barriers.
+
+```{r Step 2: Generators}
+## Capacity Generator
+capacity_gen <- Generator$new(description = "capacity",
+                              region = region,
+                              generate_rasters = FALSE, # use but don't generate
+                              ice = ice_inv,
+                              burn_in_steps = burn_in_steps,
+                              gnld_pops = gnld_pops,
+                              # determine intermediate steps needed to generate the data
+                              generative_requirements = list(hs_matrix = "file",
+                                                             initial_abundance = "function",
+                                                             carrying_capacity = "function"),
+                              inputs = c("niche_ref", "density_max"), #these come from the Latin Hypercube sampler
+                              outputs = c("initial_abundance", "carrying_capacity"))
+
+# Add intermediate steps. These functions will be run in order before generating initial abundance and carrying capacity.
+# Here we tell the generator to import the HS file and save it as "hs_matrix"
+capacity_gen$add_file_template("hs_matrix",
+                               path_template = file.path(DATA_DIR, "HS_PRJ/rt_%s_HS_SCALED_PRJ.RDS"),
+                               path_params = "niche_ref", # niche reference ID, which will be in the input dataset
+                               file_type = "RDS")
+
+# Here we subset the hs_matrix to have only the region cells, and we add the burn in.
+# Also, we tell the generator to generate the carrying_capacity based on "density_max", "ice" and "hs_matrix".
+capacity_gen$add_function_template("carrying_capacity",
+                                   function_def = function(params) {
+                                     hs_matrix <- params$hs_matrix[params$region$region_indices,]
+                                     hs_matrix[!is.finite(hs_matrix)] <- 0
+                                     hs_matrix <- cbind(replicate(params$burn_in_steps, hs_matrix[,1]), hs_matrix)
+                                     cc <- round(params$density_max*hs_matrix*params$ice)
+                                     if(sum(cc[params$gnld_pops, 1]) > 0){
+                                       cc[params$gnld_pops,1] <- 0 
+                                     }
+                                     return(cc)
+                                   },
+                                   call_params = c("density_max", "hs_matrix", "ice", "burn_in_steps", "region", "gnld_pops"))
+
+# Here we tell the generator what function to use to generate initial_abundance based on the parameters density_max and hs_matrix
+capacity_gen$add_function_template("initial_abundance",
+                                   function_def = function(params) {
+                                     params$carrying_capacity[,1] # the first time step of carrying capacity
+                                   },
+                                   call_params = c("carrying_capacity"))
+
+## Dispersal Generator
+# Distance-based dispersal generator: dispersal = p*exp(-1*distance/b) up to d_max (r)
+b_lookup <- data.frame(d_max = -Inf, b = 0:233)
+for (i in 2:234) {
+  b_lookup$d_max[i] <- which.max(exp(-1*(1:701)/b_lookup$b[i]) <= 0.05)
+}
+dispersal_gen <- DispersalGenerator$new(region = region,
+                                        dispersal_max_distance = 700, # km
+                                        distance_scale = 1000, # km
+                                        dispersal_function_data = b_lookup,
+                                        dispersal_friction = DispersalFriction$new(conductance = friction),
+                                        inputs = c("dispersal_p",
+                                                   "dispersal_r"),
+                                        decimals = 3)
+
+# it is suggested to pre-calculate and save the distance data in an external file to be imported before running the simulations,
+# as calculating the distance data may take few hours.
+dispersal_gen$calculate_distance_data(distance_matrix = distance_matrix) # pre-calculate (this step can take few hours)
+
+## Human Density Generator
+# Calculate 95th percentile which will be used as upper threshold when scaling
+human_threshold_mean <- quantile(humans_mean[humans_mean > 0], 0.95, na.rm = FALSE)
+
+human_density_gen <- Generator$new(description = "Human Density Generator",
+                                   humans_abundance = humans_mean,
+                                   humans_var = humans_sd,
+                                   human_threshold = human_threshold_mean,
+                                   spatial_correlation = env_corr,
+                                   generate_rasters = FALSE,
+                                   generative_requirements = list(distrib_var = 'function',
+                                                                  p_window = 'function',
+                                                                  human_density = 'distribution'),
+                                   inputs = c("humans_multiplier", "p"),
+                                   outputs = c("human_density"))
+
+human_density_gen$add_function_template("distrib_var",
+                                        function_def = function(params) {
+                                          distrib_sd <- params$humans_multiplier*params$humans_var
+                                          return(distrib_sd)
+                                        },
+                                        call_params = c("humans_var", "humans_multiplier"))
+
+# In this step we add a multiplier to the SD, which will slightly modify the expansion pattern, so all simulations are different in how humans expand across the landscape 
+human_density_gen$add_function_template("p_window",
+                                        function_def = function(params) {
+                                          w <- params$p*10/100
+                                          p_lower <- params$p - w
+                                          p_upper <- params$p + w
+                                          p_lower <- ifelse(p_lower < 0, 0, p_lower)
+                                          p_upper <- ifelse(p_upper > 1, 1, p_upper)
+                                          return(c(p_lower, p_upper))
+                                        },
+                                        call_params = c("p"))
+
+# Here the density will be generated based on the mean ad SD, and by using a lognormal distribution. A "p" value will determine which value within the distribution will be selected. Fianlly, the 95th percentile threshold will be used to scale the values between 0 and 1.
+human_density_gen$add_distribution_template("human_density",
+                                            distr_type = "lognormal",
+                                            distr_params = list(mean = "humans_abundance", sd = "distrib_var"),
+                                            sample = c("p_window"),#list(mid = "p", window = 0.0),
+                                            normalize_threshold = "human_threshold")
+
+```
+
+Now that all the generators have been set, the next step is to sample parameter values using the Latin Hypercube sampler. The resulting dataset will be the base for the simulations.
+
+```{r Step 3: Latin Hypercube}
+# # initial_abundance: generated
+# # standard_deviation: sampled
+# # carrying_capacity: generated
+# # growth_rate_max: sampled
+# # harvest_max: sampled
+# # harvest_z: sampled
+# # harvest_max_n: sampled
+# # human_density: generated
+# # dispersal_data: generated
+
+nsims <- 10
+
+niche_lookup <- list.files("./Data/HS_PRJ/")
+niche_lookup1 <- sapply(strsplit(niche_lookup, "_"), "[", 2)
+niche_lookup2 <- sapply(strsplit(niche_lookup, "_"), "[", 3)
+niche_lookup <- paste0(niche_lookup1, "_", niche_lookup2)
+rm(niche_lookup1, niche_lookup2)
+
+lhs_gen <- LatinHypercubeSampler$new()
+lhs_gen$set_class_parameter("niche_ref", niche_lookup) # Here used only 5 niches
+lhs_gen$set_uniform_parameter("standard_deviation", lower = 0.00, upper = 0.35, decimals = 2)
+lhs_gen$set_uniform_parameter("growth_rate_max", lower = log(1.75), upper = log(7.94), decimals = 2)
+lhs_gen$set_uniform_parameter("density_max", lower = 1000, upper = 15500, decimals = 0)
+lhs_gen$set_uniform_parameter("dispersal_p", lower = 0.05, upper = 0.30, decimals = 2)
+lhs_gen$set_uniform_parameter("dispersal_r", lower = 100, upper = 675, decimals = 0)
+lhs_gen$set_uniform_parameter("abundance_threshold", lower = 0, upper = 500, decimals = 0)
+lhs_gen$set_uniform_parameter("harvest_max", lower = 0.05, upper = 0.50, decimals = 2)
+lhs_gen$set_uniform_parameter("harvest_z", lower = 1, upper = 2)
+lhs_gen$set_uniform_parameter("humans_multiplier", lower = 0, upper = 1, decimals = 2)
+lhs_gen$set_uniform_parameter("p", lower = 0, upper = 1, decimals = 2)
+sample_data <- lhs_gen$generate_samples(number = nsims, random_seed = 123)
+sample_data$sample <- c(1:nsims)
+sample_data # examine
+```
+
+Now that the dataset is ready, the last step is to use a simulator manager that runs the simulations. We will have to specify an output directory called "OUTPUT_DIR".
+
+```{r Step 4: Simulations}
+sim_manager <- SimulationManager$new(sample_data = sample_data, # dataset
+                                     model_template = model_template, # model template
+                                     generators = list(capacity_gen, # generators
+                                                       dispersal_gen,
+                                                       human_density_gen),
+                                     parallel_cores = 50L,
+                                     results_dir = OUTPUT_DIR) # specify output directory
+
+# add attributes to be included in the output name, by referring to specific columns in "sample_data"
+# this will produce something like: "sample_1_results.RData"
+sim_manager$results_filename_attributes <- c("sample", "results") # add attributes included in the output name
+
+system.time(run_output <- sim_manager$run()) # run simulations
+run_output$summary # this will tell if any problems occurred
+```
+
