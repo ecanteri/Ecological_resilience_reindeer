@@ -1,7 +1,9 @@
-# Reindeer_Appendix02
-This repository contains the example code to run process-explicit models for reindeer.
+# Appendix 1 and 2
+This repository contains the data used to build the climatic niche of the reindeer (Appendix 1) and an example code to run process-explicit models for reindeer (Appendix 2).
 
-Files and folders include:
+Appendix 1 is a .csv file cintaining the fossil and the modern occurrence records (Sheets 2 and 4) and their relative metadata explaining the column names (Sheets 1 and 3).
+
+Apendix 2 is a folder containing the data and code necessary to run the process-explicit models. Files and folders include:
 - Reindeer_Appendix02.Rproj
 - SimulationsWorkflow.Rmd
 - ice_inv_prj.RDS
